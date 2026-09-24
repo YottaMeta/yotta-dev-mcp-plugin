@@ -1,0 +1,25 @@
+{
+  "name": "yotta-dev-mcp",
+  "interface": {
+    "displayName": "开发能力 yotta-dev-mcp (YottaMeta)"
+  },
+  "plugins": [
+    {
+      "name": "yotta-dev-mcp",
+      "source": ".",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "version": "0.1.0",
+      "description": "YottaDev MCP (yotta-dev-mcp) - deterministic local development tools exposed over stdio MCP: repo_map, find_code, compress_output, review_code, review_diff, mcp_doctor, scan_secrets, scan_dependencies, check_publish_readiness, run_checks, scaffold_skill and workflow_state. Python 3.8+ standard library, offline by default; writes and command execution require explicit flags.",
+      "interface": {
+        "displayName": "开发能力 yotta-dev-mcp",
+        "shortDescription": "YottaDev MCP (yotta-dev-mcp) - deterministic local development tools exposed over stdio MCP: repo_map, find_code, compre",
+        "developerName": "YottaMeta",
+        "category": "Developer Tools"
+      }
+    }
+  ]
+}

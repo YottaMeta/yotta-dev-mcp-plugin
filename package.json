@@ -1,0 +1,22 @@
+{
+  "name": "@yottameta/yotta-dev-mcp-plugin",
+  "version": "0.1.0",
+  "description": "YottaDev MCP Agent Plugin: deterministic local development tools over stdio MCP.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YottaMeta/yotta-dev-mcp-plugin.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    ".agents",
+    ".claude-plugin",
+    "LICENSE",
+    "README.md",
+    "mcp.json",
+    "plugin.json",
+    "skills"
+  ]
+}
