@@ -8,7 +8,6 @@ tool explicitly documents a write.
 """
 
 import argparse
-import ast
 import json
 import math
 import os
@@ -18,133 +17,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+import dev_contract
+from dev_adapters import run_adapter as _run_adapter_impl
+from dev_architecture import architecture_review as _architecture_review_impl
+from dev_common import (
+    ANSI_RE, ERROR_RE, MAX_FILE_BYTES, VERIFY_LEVELS, _iter_files, _json_safe,
+    _language, _read_text, _rel,
+    _frontmatter_name, _frontmatter_version, source_exts,
+)
+from dev_impact import impact_analysis as _impact_analysis_impl
+from dev_verify import verify_change as _verify_change_impl
+from dev_selftest import self_test
+from dev_model import _repo_map_js, _repo_map_python, system_model as _system_model_impl
 from dev_rules import REVIEW_RULES
 
-VERSION = "0.1.1"
-
-IGNORE_DIRS = {
-    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
-    "dist", "build", ".next", ".nuxt", ".cache", ".tmp", ".tmp2",
-}
-SOURCE_EXTS = {
-    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".sh", ".ps1",
-    ".go", ".rs", ".java", ".kt", ".kts", ".rb", ".php",
-}
-TEXT_EXTS = SOURCE_EXTS | {".json", ".md", ".txt", ".yml", ".yaml", ".toml", ".ini", ".cfg"}
-MAX_FILE_BYTES = 2 * 1024 * 1024
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-ERROR_RE = re.compile(
-    r"(?i)(traceback|exception|\berror\b|\bfailed\b|\bfail\b|fatal|panic|"
-    r"assertion|npm err!|\berr\b|\bwarn(?:ing)?\b)"
-)
+VERSION = "0.2.0"
 
 
-def _json_safe(value):
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    return value
 
 
-def _read_text(path):
-    path = Path(path)
-    if path.stat().st_size > MAX_FILE_BYTES:
-        raise ValueError("文件超过大小上限: %s" % path)
-    data = path.read_bytes()
-    if b"\x00" in data[:4096]:
-        raise ValueError("二进制文件不参与文本扫描: %s" % path)
-    return data.decode("utf-8", errors="replace")
 
 
-def _iter_files(root, extensions=None, max_files=5000, all_files=False):
-    root = Path(root)
-    extensions = set(extensions or TEXT_EXTS)
-    count = 0
-    for current, dirs, files in os.walk(str(root)):
-        dirs[:] = sorted(d for d in dirs if d not in IGNORE_DIRS)
-        for name in sorted(files):
-            path = Path(current) / name
-            if path.is_symlink():
-                continue
-            if not all_files and extensions and path.suffix.lower() not in extensions:
-                continue
-            if path.stat().st_size > MAX_FILE_BYTES:
-                continue
-            yield path
-            count += 1
-            if count >= max_files:
-                return
-
-
-def _rel(root, path):
-    try:
-        return str(Path(path).resolve().relative_to(Path(root).resolve())).replace("\\", "/")
-    except ValueError:
-        return str(Path(path)).replace("\\", "/")
-
-
-def _language(path):
-    ext = Path(path).suffix.lower()
-    if ext == ".py":
-        return "python"
-    if ext in (".js", ".jsx", ".mjs", ".cjs"):
-        return "javascript"
-    if ext in (".ts", ".tsx"):
-        return "typescript"
-    if ext in (".sh", ".ps1"):
-        return "shell"
-    return ext.lstrip(".") or "text"
-
-
-def _resolve_python_import(source_rel, node):
-    source = Path(source_rel)
-    if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names]
-    if not isinstance(node, ast.ImportFrom):
-        return []
-    if node.level:
-        parts = list(source.with_suffix("").parts[:-1])
-        if node.level > 1:
-            parts = parts[:-(node.level - 1)] if len(parts) >= node.level - 1 else []
-        prefix = "/".join(parts)
-        module = node.module or ""
-        target = (prefix + "/" + module.replace(".", "/")).strip("/")
-        return [target + ".py" if target else source_rel]
-    if node.module:
-        return [node.module]
-    return []
-
-
-def _repo_map_python(path, rel):
-    text = _read_text(path)
-    imports = []
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return imports
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for target in _resolve_python_import(rel, node):
-                imports.append({"source": rel, "target": target, "line": getattr(node, "lineno", 1)})
-    return imports
-
-
-def _repo_map_js(path, rel):
-    text = _read_text(path)
-    imports = []
-    patterns = [
-        re.compile(r"""(?:from\s+|import\s*\()\s*['"]([^'"]+)['"]"""),
-        re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
-    ]
-    for lineno, line in enumerate(text.splitlines(), 1):
-        for pattern in patterns:
-            for match in pattern.finditer(line):
-                imports.append({"source": rel, "target": match.group(1), "line": lineno})
-    return imports
 
 
 def repo_map(path, max_files=2000):
@@ -189,10 +82,6 @@ def repo_map(path, max_files=2000):
         "entrypoints": entrypoints,
         "truncated": truncated,
     }
-
-
-def source_exts():
-    return set(SOURCE_EXTS)
 
 
 def _classify_match(line, query):
@@ -382,16 +271,6 @@ def review_diff(diff_text=None, path=None, base=None, max_findings=200):
     findings.sort(key=lambda item: (item["path"], item["line"], item["rule"]))
     truncated = len(findings) > max_findings
     return {"files": files, "findings": findings[:max_findings], "truncated": truncated}
-
-
-def _frontmatter_version(text):
-    match = re.search(r"(?m)^version:\s*[\"']?([^\"'\r\n]+)", text)
-    return match.group(1).strip() if match else None
-
-
-def _frontmatter_name(text):
-    match = re.search(r"(?m)^name:\s*[\"']?([^\"'\r\n]+)", text)
-    return match.group(1).strip() if match else None
 
 
 def _default_skill_dirs():
@@ -956,9 +835,165 @@ def workflow_state(root, action="read", date=None, text=None, file=None, apply=F
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def system_model(path, max_files=2000, contract_file=None):
+    """Build the deterministic system model through the stable engine facade."""
+    return _system_model_impl(
+        path, max_files=max_files, contract_file=contract_file,
+    )
+
+
+def architecture_review(path, max_files=2000, contract_file=None):
+    """Review architecture through the stable engine facade."""
+    return _architecture_review_impl(
+        path, max_files=max_files, contract_file=contract_file,
+    )
+
+
+def impact_analysis(path, changed_files=None, diff=None, symbols=None, depth=3,
+                    max_files=2000, contract_file=None):
+    """Build the change impact cone through the stable engine facade."""
+    return _impact_analysis_impl(
+        path, changed_files=changed_files, diff=diff, symbols=symbols,
+        depth=depth, max_files=max_files, contract_file=contract_file,
+    )
+
+
+def verify_change(path, changed_files=None, diff=None, symbols=None, depth=3,
+                  levels=None, allow_execute=False, timeout=120,
+                  max_files=2000, contract_file=None, policy_file=None):
+    """Run the verification ladder through the stable engine facade."""
+    return _verify_change_impl(
+        path, changed_files=changed_files, diff=diff, symbols=symbols,
+        depth=depth, levels=levels, allow_execute=allow_execute, timeout=timeout,
+        max_files=max_files, contract_file=contract_file, policy_file=policy_file,
+    )
+
+
+def run_adapter(path, action="list", adapter=None, allow_execute=False, timeout=120,
+                max_chars=120000, token_budget=None, target="."):
+    """Probe or explicitly run one optional external adapter.
+
+    The implementation lives in dev_adapters.py; this facade keeps the public
+    dispatch signature and fail-closed default visible to self_test.
+    """
+    return _run_adapter_impl(
+        path, action=action, adapter=adapter, allow_execute=allow_execute,
+        timeout=timeout, max_chars=max_chars, token_budget=token_budget,
+        target=target,
+    )
+
+
 def dispatch(name, arguments):
     handlers = {
         "repo_map": repo_map,
+        "system_model": system_model,
+        "architecture_review": architecture_review,
+        "impact_analysis": impact_analysis,
+        "verify_change": verify_change,
+        "self_test": self_test,
+        "run_adapter": run_adapter,
         "find_code": find_code,
         "compress_output": compress_output,
         "review_code": review_code,
@@ -982,6 +1017,62 @@ def main():
     sub = parser.add_subparsers(dest="command")
     repo = sub.add_parser("repo-map")
     repo.add_argument("path")
+    model = sub.add_parser("system-model")
+    model.add_argument("path")
+    model.add_argument("--contract", help="contract path relative to the repository root")
+    review = sub.add_parser("architecture-review")
+    review.add_argument("path")
+    review.add_argument("--contract", help="contract path relative to the repository root")
+    impact = sub.add_parser("impact-analysis")
+    impact.add_argument("path")
+    impact.add_argument("--changed", action="append",
+                        help="repository-relative changed file (repeatable)")
+    impact.add_argument("--diff-file", help="read a unified diff from this file")
+    impact.add_argument("--symbol", action="append",
+                        help="target symbol whose definition site is the change (repeatable)")
+    impact.add_argument("--depth", type=int, default=3,
+                        help="reverse-dependency depth, 1-10 (default 3)")
+    impact.add_argument("--contract", help="contract path relative to the repository root")
+    verify = sub.add_parser("verify-change")
+    verify.add_argument("path")
+    verify.add_argument("--changed", action="append",
+                       help="repository-relative changed file (repeatable)")
+    verify.add_argument("--diff-file", help="read a unified diff from this file")
+    verify.add_argument("--symbol", action="append",
+                        help="target symbol whose definition site is the change (repeatable)")
+    verify.add_argument("--level", action="append", choices=VERIFY_LEVELS,
+                        help="additional verification level (repeatable)")
+    verify.add_argument("--depth", type=int, default=3,
+                        help="reverse-dependency depth, 1-10 (default 3)")
+    verify.add_argument("--contract", help="contract path relative to the repository root")
+    verify.add_argument("--policy-file", help="verification policy path relative to the root")
+    verify.add_argument("--allow-execute", action="store_true",
+                        help="run whitelisted L2-L4 policy checks")
+    verify.add_argument("--timeout", type=int, default=120,
+                        help="upper bound for each check in seconds")
+    self_test_parser = sub.add_parser("self-test")
+    self_test_parser.add_argument("path")
+    self_test_parser.add_argument("--mode", choices=("auto", "source", "installed"),
+                                  default="auto")
+    self_test_parser.add_argument("--allow-execute", action="store_true",
+                                  help="run the target test suite")
+    self_test_parser.add_argument("--timeout", type=int, default=120,
+                                  help="test timeout in seconds")
+    adapter = sub.add_parser("adapter")
+    adapter.add_argument("path")
+    adapter.add_argument("--action", choices=("list", "run"), default="list")
+    adapter.add_argument("--adapter",
+                         choices=("import-linter", "dependency-cruiser", "repomix"))
+    adapter.add_argument("--allow-execute", action="store_true",
+                        help="run the selected adapter; required for action=run")
+    adapter.add_argument("--timeout", type=int, default=120,
+                        help="adapter timeout in seconds")
+    adapter.add_argument("--max-chars", type=int, default=120000,
+                        help="Repomix output cap")
+    adapter.add_argument("--token-budget", type=int,
+                        help="optional Repomix token budget")
+    adapter.add_argument("--target", default=".",
+                        help="repository-relative adapter target, default .")
     find = sub.add_parser("find-code")
     find.add_argument("path")
     find.add_argument("query")
@@ -995,6 +1086,39 @@ def main():
     args = parser.parse_args()
     if args.command == "repo-map":
         result = repo_map(args.path)
+    elif args.command == "system-model":
+        result = system_model(args.path, contract_file=args.contract)
+    elif args.command == "architecture-review":
+        result = architecture_review(args.path, contract_file=args.contract)
+    elif args.command == "impact-analysis":
+        diff_text = None
+        if args.diff_file:
+            diff_text = Path(args.diff_file).read_text(encoding="utf-8")
+        result = impact_analysis(args.path, changed_files=args.changed, diff=diff_text,
+                                 symbols=args.symbol, depth=args.depth,
+                                 contract_file=args.contract)
+    elif args.command == "verify-change":
+        diff_text = None
+        if args.diff_file:
+            diff_text = Path(args.diff_file).read_text(encoding="utf-8")
+        result = verify_change(
+            args.path, changed_files=args.changed, diff=diff_text,
+            symbols=args.symbol, depth=args.depth, levels=args.level,
+            allow_execute=args.allow_execute, timeout=args.timeout,
+            contract_file=args.contract, policy_file=args.policy_file,
+        )
+    elif args.command == "self-test":
+        result = self_test(
+            args.path, mode=args.mode, allow_execute=args.allow_execute,
+            timeout=args.timeout,
+        )
+    elif args.command == "adapter":
+        result = run_adapter(
+            args.path, action=args.action, adapter=args.adapter,
+            allow_execute=args.allow_execute, timeout=args.timeout,
+            max_chars=args.max_chars, token_budget=args.token_budget,
+            target=args.target,
+        )
     elif args.command == "find-code":
         result = find_code(args.path, args.query)
     elif args.command == "compress-output":

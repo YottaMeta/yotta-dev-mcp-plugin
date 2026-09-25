@@ -6,8 +6,8 @@ Protocol support is dual-era:
   * modern: MCP 2026-07-28, server/discover + per-request _meta
   * legacy: initialize handshake with protocolVersion 2025-11-25
 
-The six tools in this first slice are local, deterministic and read-only:
-repo_map / find_code / compress_output / review_code / review_diff / mcp_doctor.
+Tools are local, deterministic and read-only unless a tool explicitly documents
+an opt-in write or an explicit execution flag.
 """
 
 import json
@@ -55,7 +55,8 @@ def _tool(name, arguments):
 
 TOOL_HANDLERS = {
     name: (lambda arguments, tool_name=name: _tool(tool_name, arguments))
-    for name in ("repo_map", "find_code", "compress_output",
+    for name in ("repo_map", "system_model", "architecture_review", "impact_analysis",
+                 "verify_change", "self_test", "run_adapter", "find_code", "compress_output",
                  "review_code", "review_diff", "mcp_doctor",
                  "scan_secrets", "scan_dependencies", "check_publish_readiness",
                  "run_checks", "scaffold_skill", "workflow_state")
@@ -79,6 +80,230 @@ def mcp_tools():
                                   "description": "Maximum source files to inspect (default 2000)"},
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "system_model",
+            "description": (
+                "Build a deterministic system model (modules, imports, entrypoints, "
+                "tests, configs, data stores) and attach layer data from the "
+                ".yotta/architecture.json contract. Returns PASS, FAIL or UNKNOWN "
+                "plus the unknowns that still need evidence. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository or source directory"},
+                    "max_files": {"type": "integer", "minimum": 1,
+                                  "description": "Maximum source files to inspect (default 2000)"},
+                    "contract_file": {
+                        "type": "string",
+                        "description": "Contract path relative to the repository root "
+                                       "(default .yotta/architecture.json)",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "architecture_review",
+            "description": (
+                "Review a local repository against the .yotta/architecture.json contract: "
+                "dependency rules, boundary visibility and data ownership, each finding "
+                "with file, line and severity. critical/high findings fail the review; "
+                "medium/low are advisory; unverifiable items become UNKNOWN. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository or source directory"},
+                    "max_files": {"type": "integer", "minimum": 1,
+                                  "description": "Maximum source files to inspect (default 2000)"},
+                    "contract_file": {
+                        "type": "string",
+                        "description": "Contract path relative to the repository root "
+                                       "(default .yotta/architecture.json)",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "impact_analysis",
+            "description": (
+                "Build the change impact cone for local changes: reverse-dependency "
+                "consumers, affected layers, boundaries, data stores and invariants, "
+                "mapped tests, an explainable blast radius and rollback probes. Accepts "
+                "changed_files, a unified diff or target symbols. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository or source directory"},
+                    "changed_files": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Repository-relative changed files",
+                    },
+                    "diff": {"type": "string",
+                             "description": "Unified diff text to read changed files from"},
+                    "symbols": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Target symbols; their definition sites become the change",
+                    },
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 10,
+                              "description": "Reverse-dependency depth (default 3)"},
+                    "max_files": {"type": "integer", "minimum": 1,
+                                  "description": "Maximum source files to inspect (default 2000)"},
+                    "contract_file": {
+                        "type": "string",
+                        "description": "Contract path relative to the repository root "
+                                       "(default .yotta/architecture.json)",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "verify_change",
+            "description": (
+                "Run the L0-L5 verification ladder for a local change and return "
+                "a deterministic evidence ledger. L0 syntax/contract and L1 "
+                "architecture checks run by default; L2-L4 require a whitelisted "
+                ".yotta/verification.json check plus allow_execute=true. L5 is "
+                "always recorded as manual work. Read-only unless execution is "
+                "explicitly enabled."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository or source directory"},
+                    "changed_files": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Repository-relative changed files",
+                    },
+                    "diff": {"type": "string",
+                             "description": "Unified diff text to read changed files from"},
+                    "symbols": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Target symbols; their definition sites become the change",
+                    },
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 10,
+                              "description": "Reverse-dependency depth (default 3)"},
+                    "levels": {
+                        "type": "array",
+                        "items": {"enum": ["L0", "L1", "L2", "L3", "L4", "L5"]},
+                        "description": "Additional verification levels; L2-L4 require "
+                                       "a policy and explicit execution",
+                    },
+                    "allow_execute": {
+                        "type": "boolean",
+                        "description": "Must be true to run whitelisted policy checks; default false",
+                    },
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 600,
+                                "description": "Upper bound for each check in seconds (default 120)"},
+                    "max_files": {"type": "integer", "minimum": 1,
+                                  "description": "Maximum source files to inspect (default 2000)"},
+                    "contract_file": {
+                        "type": "string",
+                        "description": "Contract path relative to the repository root "
+                                       "(default .yotta/architecture.json)",
+                    },
+                    "policy_file": {
+                        "type": "string",
+                        "description": "Verification policy path relative to the repository root "
+                                       "(default .yotta/verification.json)",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "self_test",
+            "description": (
+                "Run deterministic integrity checks on yotta-dev-mcp itself: "
+                "required files, version alignment, protocol/tool schema drift, "
+                "fail-closed write gates and seeded-defect counterexamples. Use "
+                "installed mode for a skill copy and source mode for the checkout. "
+                "Test-suite execution requires allow_execute=true; read-only by default."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Source checkout or installed skill directory"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "source", "installed"],
+                        "description": "auto detects source vs installed layout",
+                    },
+                    "allow_execute": {
+                        "type": "boolean",
+                        "description": "Run the project test suite; default false",
+                    },
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 600,
+                                "description": "Test timeout in seconds (default 120)"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "run_adapter",
+            "description": (
+                "Probe or explicitly run an optional local architecture adapter. "
+                "action=list only inspects project-local node_modules/.bin, venv and "
+                "PATH for import-linter, dependency-cruiser and Repomix; action=run "
+                "requires allow_execute=true. The adapter never installs packages, "
+                "downloads files or accepts arbitrary argv. Missing tools or configs "
+                "return UNKNOWN with the next step."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "run"],
+                        "description": "list probes capability; run executes one adapter",
+                    },
+                    "path": {"type": "string", "description": "Repository root"},
+                    "adapter": {
+                        "type": "string",
+                        "enum": ["import-linter", "dependency-cruiser", "repomix"],
+                        "description": "Adapter id; required when action=run",
+                    },
+                    "allow_execute": {
+                        "type": "boolean",
+                        "description": "Must be true to run an adapter; default false",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600,
+                        "description": "Adapter timeout in seconds (default 120)",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 1000000,
+                        "description": "Repomix output cap in characters (default 120000)",
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500000,
+                        "description": "Optional Repomix token budget",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Repository-relative adapter target (default .)",
+                    },
+                },
+                "required": ["action", "path"],
                 "additionalProperties": False,
             },
         },
@@ -338,8 +563,12 @@ def handle_message(msg):
                         "yotta-dev-mcp exposes deterministic local development tools. "
                         "Prefer repo_map/find_code before editing, review_diff before PR, "
                         "review_code for focused review, compress_output for long logs and "
-                        "mcp_doctor for local configuration checks. All six tools are offline "
-                        "and read-only."
+                        "mcp_doctor for local configuration checks. Use system_model and "
+                        "architecture_review for architecture contracts, impact_analysis and "
+                        "verify_change for change-centered evidence, self_test for integrity "
+                        "checks, and run_adapter to probe or explicitly run optional local "
+                        "architecture adapters. Tools are offline and read-only unless an "
+                        "explicit write or execute flag is set."
                     ),
                 }, (3600000, "public")),
             }
