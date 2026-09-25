@@ -1,6 +1,6 @@
-# 开发能力 yotta-dev-mcp — Agent Plugin
+# 元开 yotta-dev-mcp — Agent Plugin
 
-Deterministic local development tools over stdio MCP: code map, review, secret/dependency scan, release checks, whitelisted checks, scaffold and workflow state.
+YuanKai (yotta-dev-mcp): deterministic local development tools over stdio MCP, covering code map, review, secret/dependency scan, release checks, whitelisted checks, scaffold and workflow state.
 
 [English](#english) | [中文](#中文)
 
