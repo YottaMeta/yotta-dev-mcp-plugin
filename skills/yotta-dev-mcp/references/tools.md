@@ -124,10 +124,11 @@ Input:
 - `timeout` (optional, default 120, 1-600).
 
 Source mode checks required files, version alignment across `package.json` /
-`SKILL.md` / `CHANGELOG.md` / `server.json` / engine `VERSION`, protocol tool names
-and `inputSchema.additionalProperties=false`, fail-closed defaults for every write or
-execute gate, and counterexamples. Installed mode checks `SKILL.md` and the installed
-asset payload, and records source-only checks as out of scope.
+`SKILL.md` / `CHANGELOG.md` / `server.json` / engine `VERSION`, the SKILL.md
+current-version body, protocol tool names and
+`inputSchema.additionalProperties=false`, fail-closed defaults for every write or
+execute gate, and counterexamples. Installed mode runs three checks: files,
+skill-version and verifier-counterexamples; source-only checks are out of scope.
 
 The counterexample suite is in-process and deterministic: a seeded forbidden
 dependency must be `FAIL`, removing the rule must stop the failure, an invalid
@@ -202,7 +203,9 @@ Each finding contains `path`, `line`, `rule`, `severity`, `evidence`, `suggestio
 Input:
 
 - `diff_text` or `path` (one required).
-- `base` (optional git revision when `path` is used).
+- `base` (optional git revision when `path` is used). It is resolved to a commit SHA
+  before `git diff` runs; option-like, whitespace-containing, oversized or
+  unresolvable revisions are rejected.
 - `max_findings` (optional).
 
 Only added lines are reviewed. Output: `files`, `findings`, `truncated`.
@@ -211,6 +214,23 @@ Only added lines are reviewed. Output: `files`, `findings`, `truncated`.
 directories, scratch / probe / sandbox / debug directories and probe/temp
 file names do not flood the result. `review_diff` only reviews added lines,
 so it is unaffected by directory traversal.
+
+Optional `.review-allowlist.json` (or `.yotta/review-allowlist.json`) suppresses
+known-intentional findings by exact path + rule + line. No wildcards are
+supported; `reason` is required. The root-level file is copied by the installer,
+so installed copies keep the same exemptions.
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {"path": "scripts/example.py", "rule": "debug-print", "line": 12, "reason": "CLI help output"}
+  ]
+}
+```
+
+Output adds `suppressed`, `suppressed_findings` and `allowlist_errors`.
+An invalid allowlist fails closed: findings are not suppressed.
 
 ## mcp_doctor
 
@@ -287,4 +307,6 @@ Input: `root`, `action` (`read` / `append-log` / `append-file`), optional
 `date`, `text`, `file`, explicit `apply=true`.
 
 Output: `ok`, `files`, `missing`, `excerpts` for read; `target`, `applied`,
-`preview` for writes. Writes are atomic and keep a `.bak` of an existing file.
+`preview` for writes. Writes use a random exclusive temporary file plus
+`os.replace`, keep a `.bak` of an existing file, and reject target or ancestor
+paths that are symlinks, junctions or other reparse points.

@@ -13,8 +13,10 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import dev_contract
@@ -41,7 +43,7 @@ from dev_model import (
 )
 from dev_rules import REVIEW_RULES
 
-VERSION = "0.2.3"
+VERSION = "0.2.7"
 
 
 
@@ -100,7 +102,13 @@ def repo_map(path, max_files=2000):
 
 
 def _classify_match(line, query):
-    escaped = re.escape(query)
+    normalized = re.sub(
+        r"^\s*(?:async\s+)?(?:def|class|function|export\s+function|const|let|var)\s+",
+        "",
+        str(query),
+    ).strip()
+    target = normalized or str(query)
+    escaped = re.escape(target)
     if re.search(r"^\s*(?:async\s+)?def\s+%s\b" % escaped, line):
         return "definition"
     if re.search(r"^\s*class\s+%s\b" % escaped, line):
@@ -205,10 +213,125 @@ def compress_output(text=None, file=None, max_chars=4000, head_lines=40, tail_li
     }
 
 
+def _split_code_comment(line_text, rel):
+    language = _language(rel)
+    if language in ("python", "shell"):
+        markers = ("#",)
+    elif language in ("javascript", "typescript"):
+        markers = ("//", "/*")
+    else:
+        markers = ("#", "//", "/*")
+    stripped = line_text.lstrip()
+    if stripped.startswith("*") and not stripped.startswith("*/"):
+        return "", line_text
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(line_text):
+        char = line_text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ("'", '"', "`"):
+            quote = char
+        else:
+            for marker in markers:
+                if line_text.startswith(marker, index):
+                    return line_text[:index], line_text[index:]
+        index += 1
+    return line_text, ""
+
+
+def _mask_strings(code):
+    chars = list(code)
+    quote = None
+    escaped = False
+    for index, char in enumerate(chars):
+        if quote:
+            if escaped:
+                escaped = False
+                chars[index] = " "
+            elif char == "\\":
+                escaped = True
+                chars[index] = " "
+            elif char == quote:
+                quote = None
+            else:
+                chars[index] = " "
+        elif char in ("'", '"', "`"):
+            quote = char
+    return "".join(chars)
+
+
+def _allowlist_candidates(root):
+    current = Path(root).resolve()
+    candidates = []
+    for base in (current, *current.parents):
+        candidates.append(base / ".yotta" / "review-allowlist.json")
+        candidates.append(base / ".review-allowlist.json")
+        if (base / ".git").exists():
+            break
+    return candidates
+
+
+def _load_review_allowlist(root):
+    for candidate in _allowlist_candidates(root):
+        if not candidate.is_file():
+            continue
+        try:
+            data = json.loads(_read_text(candidate))
+        except Exception as exc:  # noqa: BLE001
+            return {}, [{"path": str(candidate), "detail": str(exc)}]
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return {}, [{"path": str(candidate), "detail": "entries must be a list"}]
+        allowlist = {}
+        errors = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                errors.append({"path": str(candidate), "detail": "entry must be an object"})
+                continue
+            rel = entry.get("path")
+            rule = entry.get("rule")
+            line = entry.get("line")
+            reason = entry.get("reason")
+            if not isinstance(rel, str) or not isinstance(rule, str) or not reason:
+                errors.append({"path": str(candidate), "detail": "path, rule and reason are required"})
+                continue
+            if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+                errors.append({"path": str(candidate), "detail": "line must be a positive integer"})
+                continue
+            normalized = rel.replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
+            allowlist[(normalized, rule, line)] = str(reason)
+        return allowlist, errors
+    return {}, []
+
+
+def _apply_review_allowlist(findings, allowlist):
+    kept = []
+    suppressed = []
+    for item in findings:
+        key = (item["path"], item["rule"], item["line"])
+        if key in allowlist:
+            suppressed.append(dict(item, reason=allowlist[key]))
+        else:
+            kept.append(item)
+    return kept, suppressed
+
+
 def _review_line(rel, line_no, line_text):
     findings = []
+    code, comment = _split_code_comment(line_text, rel)
+    code = _mask_strings(code)
     for rule, severity, pattern, suggestion in REVIEW_RULES:
-        if pattern.search(line_text):
+        target = comment if rule == "todo-comment" else code
+        if pattern.search(target):
             findings.append({
                 "path": rel,
                 "line": line_no,
@@ -222,6 +345,8 @@ def _review_line(rel, line_no, line_text):
 
 def review_code(path=None, text=None, max_findings=200):
     findings = []
+    allowlist = {}
+    allowlist_errors = []
     if text is not None:
         for line_no, line in enumerate(str(text).splitlines(), 1):
             findings.extend(_review_line("<text>", line_no, line))
@@ -231,6 +356,8 @@ def review_code(path=None, text=None, max_findings=200):
         root = Path(path)
         if not root.exists():
             raise ValueError("路径不存在: %s" % path)
+        allowlist_root = root.parent if root.is_file() else root
+        allowlist, allowlist_errors = _load_review_allowlist(allowlist_root)
         files = [root] if root.is_file() else list(_iter_files(root, extensions=source_exts()))
         base = root.parent if root.is_file() else root
         for file_path in files:
@@ -241,9 +368,16 @@ def review_code(path=None, text=None, max_findings=200):
             rel = _rel(base, file_path)
             for line_no, line in enumerate(lines, 1):
                 findings.extend(_review_line(rel, line_no, line))
-    findings.sort(key=lambda item: (item["path"], item["line"], item["rule"]))
-    truncated = len(findings) > max_findings
-    return {"findings": findings[:max_findings], "truncated": truncated}
+    kept, suppressed = _apply_review_allowlist(findings, allowlist)
+    kept.sort(key=lambda item: (item["path"], item["line"], item["rule"]))
+    truncated = len(kept) > max_findings
+    return {
+        "findings": kept[:max_findings],
+        "truncated": truncated,
+        "suppressed": len(suppressed),
+        "suppressed_findings": suppressed[:max_findings],
+        "allowlist_errors": allowlist_errors,
+    }
 
 
 def _parse_added_lines(diff_text):
@@ -266,13 +400,39 @@ def _parse_added_lines(diff_text):
             line_no += 1
 
 
+def _resolve_git_commit(path, revision):
+    value = str(revision or "").strip()
+    if (
+        not value
+        or len(value) > 200
+        or value.startswith("-")
+        or any(char.isspace() for char in value)
+    ):
+        raise ValueError("base 不是有效 revision")
+    command = [
+        "git", "-C", str(path), "rev-parse", "--verify", "--quiet",
+        "--end-of-options", value + "^{commit}",
+    ]
+    proc = subprocess.run(command, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise ValueError("base revision 无法解析: %s" % value)
+    commit = proc.stdout.strip()
+    if not re.match(r"^[0-9a-fA-F]{40,64}$", commit):
+        raise ValueError("base revision 解析结果非法")
+    return commit
+
+
 def review_diff(diff_text=None, path=None, base=None, max_findings=200):
+    allowlist = {}
+    allowlist_errors = []
     if diff_text is None:
         if not path:
             raise ValueError("review_diff 需要 diff_text 或 path")
-        command = ["git", "-C", str(path), "diff", "--no-ext-diff", "--unified=0"]
+        allowlist, allowlist_errors = _load_review_allowlist(path)
+        command = ["git", "-C", str(path), "diff", "--no-ext-diff",
+                   "--no-textconv", "--unified=0"]
         if base:
-            command.append(str(base))
+            command.append(_resolve_git_commit(path, base))
         proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode != 0:
             raise ValueError("git diff 失败: %s" % (proc.stderr.strip() or proc.stdout.strip()))
@@ -283,9 +443,17 @@ def review_diff(diff_text=None, path=None, base=None, max_findings=200):
         if rel not in files:
             files.append(rel)
         findings.extend(_review_line(rel, line_no, line))
-    findings.sort(key=lambda item: (item["path"], item["line"], item["rule"]))
-    truncated = len(findings) > max_findings
-    return {"files": files, "findings": findings[:max_findings], "truncated": truncated}
+    kept, suppressed = _apply_review_allowlist(findings, allowlist)
+    kept.sort(key=lambda item: (item["path"], item["line"], item["rule"]))
+    truncated = len(kept) > max_findings
+    return {
+        "files": files,
+        "findings": kept[:max_findings],
+        "truncated": truncated,
+        "suppressed": len(suppressed),
+        "suppressed_findings": suppressed[:max_findings],
+        "allowlist_errors": allowlist_errors,
+    }
 
 
 def _default_skill_dirs():
@@ -306,6 +474,9 @@ def mcp_doctor(skills_dirs=None, config_paths=None, include_defaults=None):
 
 SECRET_KEY_RE = re.compile(
     r"""(?i)\b(api[_-]?key|access[_-]?key|secret|token|password|passwd|pwd)\b\s*[:=]\s*["']?([^"'\s#]{8,})"""
+)
+WEAK_PASSWORD_RE = re.compile(
+    r"""(?i)\b(password|passwd|pwd)\b\s*[:=]\s*["']?([^"'\s#]{6,7})"""
 )
 AWS_KEY_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
@@ -381,6 +552,7 @@ def scan_secrets(path=None, text=None, max_findings=200, include_git_history=Fal
     findings = []
     for rel, content in entries:
         for line_no, line in enumerate(content.splitlines(), 1):
+            specific_spans = []
             if PRIVATE_KEY_RE.search(line):
                 findings.append({
                     "path": rel, "line": line_no, "rule": "private-key",
@@ -393,6 +565,7 @@ def scan_secrets(path=None, text=None, max_findings=200, include_git_history=Fal
                     "severity": "critical", "evidence": _redact(match.group(0)),
                     "suggestion": "Rotate the key and move it to a secret manager.",
                 })
+                specific_spans.append(match.span(0))
             for match in SECRET_KEY_RE.finditer(line):
                 name = match.group(1).lower()
                 rule = "api-key" if "api" in name or "access" in name else (
@@ -403,12 +576,25 @@ def scan_secrets(path=None, text=None, max_findings=200, include_git_history=Fal
                     "severity": "high", "evidence": "%s=%s" % (match.group(1), _redact(match.group(2))),
                     "suggestion": "Remove the literal credential and load it from the environment or a secret store.",
                 })
+                specific_spans.append(match.span(2))
+            for match in WEAK_PASSWORD_RE.finditer(line):
+                findings.append({
+                    "path": rel, "line": line_no, "rule": "weak-password",
+                    "severity": "medium",
+                    "evidence": "%s=%s" % (match.group(1), _redact(match.group(2))),
+                    "suggestion": "Use a longer password and load it from the environment or a secret store.",
+                })
+                specific_spans.append(match.span(2))
             for match in HIGH_ENTROPY_RE.finditer(line):
                 token = match.group(0)
                 if (
                     _entropy(token) >= 4.0
                     and not PRIVATE_KEY_RE.search(line)
                     and not _high_entropy_noise(line, token, match.start(), match.end())
+                    and not any(
+                        start < match.end() and match.start() < end
+                        for start, end in specific_spans
+                    )
                 ):
                     findings.append({
                         "path": rel, "line": line_no, "rule": "high-entropy-token",
@@ -427,7 +613,8 @@ def _git_history_text(root):
     """Return bounded git diff text for secret scanning; never fail the scan."""
     try:
         process = subprocess.run(
-            ["git", "-C", str(root), "log", "-p", "--all", "--no-ext-diff", "--max-count=50"],
+            ["git", "-C", str(root), "log", "-p", "--all", "--no-ext-diff",
+             "--no-textconv", "--max-count=50"],
             capture_output=True, text=True, timeout=30,
         )
         if process.returncode != 0:
@@ -578,7 +765,7 @@ def check_publish_readiness(path):
     root = Path(path)
     if not root.exists() or not root.is_dir():
         raise ValueError("check_publish_readiness 需要目录: %s" % path)
-    required = ["package.json", "SKILL.md", "README.md", "LICENSE", "CHANGELOG.md"]
+    required = ["package.json", "SKILL.md", "README.md", "LICENSE", "CHANGELOG.md", "VERSION"]
     files = {}
     issues = []
     for name in required:
@@ -604,6 +791,9 @@ def check_publish_readiness(path):
     if changelog_path.is_file():
         match = re.search(r"(?m)^##\s+v?(\d+\.\d+\.\d+)", _read_text(changelog_path))
         versions["CHANGELOG.md"] = match.group(1) if match else None
+    version_path = root / "VERSION"
+    if version_path.is_file():
+        versions["VERSION"] = _read_text(version_path).strip() or None
     script_versions = []
     for script in sorted(root.glob("scripts/*.py")):
         try:
@@ -756,15 +946,80 @@ def scaffold_skill(name, output_dir, apply=False, description=None):
     }
 
 
+def _write_temp_text(path, content):
+    descriptor, name = tempfile.mkstemp(
+        prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
+
+
+def _write_temp_bytes(path, data):
+    descriptor, name = tempfile.mkstemp(
+        prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
+
+
+def _preserve_mode(source, target):
+    try:
+        os.chmod(str(target), os.stat(str(source)).st_mode & 0o777)
+    except OSError:
+        pass
+
+
+def _is_link_like(path):
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_point)
+
+
+def _assert_no_symlink_path(path, root):
+    root = Path(root)
+    current = Path(path)
+    while True:
+        if _is_link_like(current):
+            raise ValueError("拒绝通过符号链接写入: %s" % current)
+        if current == root or current.parent == current:
+            break
+        current = current.parent
+
+
 def _atomic_write(path, content):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = None
     if path.exists():
         backup = path.with_suffix(path.suffix + ".bak")
-        shutil.copy2(str(path), str(backup))
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
+        temporary_backup = _write_temp_bytes(backup, path.read_bytes())
+        _preserve_mode(path, temporary_backup)
+        os.replace(str(temporary_backup), str(backup))
+    temporary = _write_temp_text(path, content)
+    if path.exists():
+        _preserve_mode(path, temporary)
     os.replace(str(temporary), str(path))
     return str(backup) if backup else None
 
@@ -803,6 +1058,7 @@ def workflow_state(root, action="read", date=None, text=None, file=None, apply=F
     body = (text or "").rstrip() + "\n"
     preview = body
     if apply:
+        _assert_no_symlink_path(target, Path(root))
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             existing = _read_text(target)
@@ -1083,14 +1339,14 @@ def main():
     elif args.command == "impact-analysis":
         diff_text = None
         if args.diff_file:
-            diff_text = Path(args.diff_file).read_text(encoding="utf-8")
+            diff_text = Path(args.diff_file).read_text(encoding="utf-8-sig")
         result = impact_analysis(args.path, changed_files=args.changed, diff=diff_text,
                                  symbols=args.symbol, depth=args.depth,
                                  contract_file=args.contract)
     elif args.command == "verify-change":
         diff_text = None
         if args.diff_file:
-            diff_text = Path(args.diff_file).read_text(encoding="utf-8")
+            diff_text = Path(args.diff_file).read_text(encoding="utf-8-sig")
         result = verify_change(
             args.path, changed_files=args.changed, diff=diff_text,
             symbols=args.symbol, depth=args.depth, levels=args.level,

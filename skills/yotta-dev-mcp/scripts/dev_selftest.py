@@ -239,6 +239,18 @@ def _self_test_version_check(root, mode):
             return "FAIL", [{"code": "missing-version", "path": "SKILL.md",
                              "detail": "SKILL.md has no version field"}], \
                 "restore a valid SKILL.md version"
+        version_file = root / "VERSION"
+        if version_file.is_file():
+            file_version = _read_text(version_file).strip()
+            if not file_version:
+                return "FAIL", [{"code": "missing-version", "path": "VERSION",
+                                 "detail": "VERSION is empty"}], \
+                    "restore a valid VERSION file"
+            if file_version != version:
+                return "FAIL", [{
+                    "code": "version-mismatch", "path": "VERSION",
+                    "detail": "VERSION=%s SKILL.md=%s" % (file_version, version),
+                }], "align VERSION and SKILL.md versions"
         return "PASS", [], None
 
     versions = {}
@@ -270,6 +282,9 @@ def _self_test_version_check(root, mode):
         versions["engine"] = match.group(1) if match else None
     else:
         versions["engine"] = None
+    version_path = root / "VERSION"
+    if version_path.is_file():
+        versions["VERSION"] = _read_text(version_path).strip() or None
     missing = sorted(key for key, value in versions.items() if not value)
     if missing:
         return "FAIL", [{
@@ -281,7 +296,34 @@ def _self_test_version_check(root, mode):
         return "FAIL", [{
             "code": "version-mismatch", "path": "package.json",
             "detail": json.dumps(versions, ensure_ascii=False, sort_keys=True),
-        }], "align package, SKILL, CHANGELOG, server and engine versions"
+        }], "align package, SKILL, CHANGELOG, server, VERSION and engine versions"
+    return "PASS", [], None
+
+def _self_test_skill_version_body(root):
+    skill = root / "SKILL.md"
+    if not skill.is_file():
+        return "UNKNOWN", [{
+            "code": "skill-missing", "path": "SKILL.md",
+            "detail": "SKILL.md is missing",
+        }], "restore SKILL.md"
+    text = _read_text(skill)
+    version = _frontmatter_version(text)
+    if not version:
+        return "FAIL", [{
+            "code": "missing-version", "path": "SKILL.md",
+            "detail": "SKILL.md has no version field",
+        }], "restore a valid SKILL.md version"
+    section = re.search(r"(?ms)^##\s+当前版本\s*$(.*?)(?=^##\s+|\Z)", text)
+    if not section:
+        return "UNKNOWN", [{
+            "code": "version-section-missing", "path": "SKILL.md",
+            "detail": "SKILL.md has no 当前版本 section",
+        }], "add a 当前版本 section"
+    if not re.search(r"(?m)^\s*-\s*v?%s\b" % re.escape(version), section.group(1)):
+        return "FAIL", [{
+            "code": "version-section-drift", "path": "SKILL.md",
+            "detail": "current version %s is not listed in 当前版本" % version,
+        }], "add the current version to 当前版本"
     return "PASS", [], None
 
 def _self_test_tool_contracts(root):
@@ -420,6 +462,15 @@ def self_test(path, mode="auto", allow_execute=False, timeout=120):
     checks = [files_check, version_check]
     unverified = []
     if mode == "source":
+        body_status, body_evidence, body_next = _self_test_skill_version_body(root)
+        checks.append({
+            "id": "skill-version-body",
+            "status": body_status,
+            "severity": "high",
+            "claim": "SKILL.md current-version section lists the frontmatter version",
+            "evidence": body_evidence,
+            "next_step": body_next,
+        })
         tool_status, tool_evidence, tool_next = _self_test_tool_contracts(root)
         checks.append({
             "id": "tool-contracts",
